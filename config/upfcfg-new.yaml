@@ -1,0 +1,19 @@
+version: 1.0.3
+description: UPF for new slice
+pfcp:
+  addr: 0.0.0.0
+  nodeID: 0.0.0.0
+  retransTimeout: 1s
+  maxRetrans: 3
+gtpu:
+  forwarder: gtp5g
+  ifList:
+    - addr: 0.0.0.0
+      type: N3
+dnnList:
+  - dnn: internet
+    cidr: 10.62.0.0/16
+logger:
+  enable: true
+  level: info
+  reportCaller: false

@@ -1,0 +1,57 @@
+name: Deploy free5GC
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write
+  contents: read
+
+env:
+  AWS_REGION: ap-northeast-1
+  ROLE_ARN: ${{ vars.AWS_ROLE_ARN }}
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ env.ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get default VPC and Subnet
+        id: vpc
+        run: |
+          VPC_ID=$(aws ec2 describe-vpcs --filters "Name=isDefault,Values=true" --query "Vpcs[0].VpcId" --output text)
+          SUBNET_ID=$(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC_ID" "Name=default-for-az,Values=true" --query "Subnets[0].SubnetId" --output text)
+          CIDR=$(aws ec2 describe-vpcs --vpc-ids "$VPC_ID" --query "Vpcs[0].CidrBlock" --output text)
+          echo "vpc_id=$VPC_ID" >> "$GITHUB_OUTPUT"
+          echo "subnet_id=$SUBNET_ID" >> "$GITHUB_OUTPUT"
+          echo "cidr=$CIDR" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy via CloudFormation
+        run: |
+          STACK_NAME="free5gc-$(echo '${{ github.repository }}' | tr '/' '-')"
+
+          STATUS=$(aws cloudformation describe-stacks --stack-name "$STACK_NAME" \
+            --query "Stacks[0].StackStatus" --output text 2>/dev/null || echo "NONE")
+          if echo "$STATUS" | grep -qE "ROLLBACK_COMPLETE|DELETE_FAILED|CREATE_FAILED|UPDATE_ROLLBACK_FAILED"; then
+            aws cloudformation delete-stack --stack-name "$STACK_NAME"
+            aws cloudformation wait stack-delete-complete --stack-name "$STACK_NAME"
+          fi
+
+          aws cloudformation deploy \
+            --template-file infra/cloudformation.yaml \
+            --stack-name "$STACK_NAME" \
+            --capabilities CAPABILITY_NAMED_IAM \
+            --parameter-overrides \
+              VpcId=${{ steps.vpc.outputs.vpc_id }} \
+              SubnetId=${{ steps.vpc.outputs.subnet_id }} \
+              AllowedCidr=${{ steps.vpc.outputs.cidr }} \
+              GitHubRepo=https://github.com/${{ github.repository }}.git \
+            --no-fail-on-empty-changeset

@@ -1,0 +1,113 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Base infrastructure for free5GC UPF workshop
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  SubnetId:
+    Type: AWS::EC2::Subnet::Id
+  AllowedCidr:
+    Type: String
+    Default: 172.31.0.0/16
+  InstanceType:
+    Type: String
+    Default: t3.medium
+  GitHubRepo:
+    Type: String
+    Default: https://github.com/free5gc/free5gc-compose.git
+
+Resources:
+  Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles: [!Ref Role]
+
+  SG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Base SG for free5GC EC2
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref AllowedCidr
+        - IpProtocol: udp
+          FromPort: 8805
+          ToPort: 8805
+          CidrIp: !Ref AllowedCidr
+        - IpProtocol: udp
+          FromPort: 2152
+          ToPort: 2152
+          CidrIp: !Ref AllowedCidr
+
+  UPFInstance:
+    Type: AWS::EC2::Instance
+    Properties:
+      InstanceType: !Ref InstanceType
+      SubnetId: !Ref SubnetId
+      SecurityGroupIds: [!Ref SG]
+      IamInstanceProfile: !Ref InstanceProfile
+      ImageId: !Sub '{{resolve:ssm:/aws/service/canonical/ubuntu/server/22.04/stable/current/amd64/hvm/ebs-gp2/ami-id}}'
+      Tags:
+        - Key: Name
+          Value: upf-new
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash -xe
+          hostnamectl set-hostname upf-new
+          snap remove amazon-ssm-agent || true
+          wget -q https://s3.amazonaws.com/ec2-downloads-windows/SSMAgent/latest/debian_amd64/amazon-ssm-agent.deb -O /tmp/ssm.deb
+          dpkg -i /tmp/ssm.deb
+          systemctl enable amazon-ssm-agent
+          systemctl start amazon-ssm-agent
+          apt-get update -y
+          apt-get install -y ca-certificates curl gnupg git
+          install -m 0755 -d /etc/apt/keyrings
+          curl -fsSL https://download.docker.com/linux/ubuntu/gpg | gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu $(lsb_release -cs) stable" > /etc/apt/sources.list.d/docker.list
+          apt-get update -y
+          apt-get install -y docker-ce docker-ce-cli containerd.io docker-compose-plugin
+          usermod -aG docker ubuntu
+          mkdir -p /etc/docker
+          cat > /etc/docker/daemon.json <<'EOF'
+          {"iptables": false}
+          EOF
+          systemctl restart docker
+          apt-get install -y gcc gcc-12 make linux-headers-$(uname -r)
+          git clone --branch v0.9.5 --depth 1 https://github.com/free5gc/gtp5g.git /tmp/gtp5g
+          cd /tmp/gtp5g && make && make install
+          modprobe gtp5g
+          sysctl -w net.ipv4.ip_forward=1
+          echo "net.ipv4.ip_forward=1" >> /etc/sysctl.conf
+          su - ubuntu -c "git clone https://github.com/free5gc/free5gc-compose.git /home/ubuntu/free5gc-compose"
+          cp /home/ubuntu/free5gc-compose/docker-compose.yaml /tmp/dc.yaml
+          cp -r /home/ubuntu/free5gc-compose/config /tmp/config-orig
+          su - ubuntu -c "cd /home/ubuntu/free5gc-compose && git remote set-url origin ${GitHubRepo} && git fetch origin main && git reset --hard origin/main"
+          cp /tmp/dc.yaml /home/ubuntu/free5gc-compose/docker-compose.yaml
+          cp -n /tmp/config-orig/* /home/ubuntu/free5gc-compose/config/ 2>/dev/null || true
+          chown -R ubuntu:ubuntu /home/ubuntu/free5gc-compose
+          cd /home/ubuntu/free5gc-compose && docker compose -f docker-compose-upf-only.yaml up -d
+
+Outputs:
+  SGId:
+    Value: !Ref SG
+  InstanceProfileName:
+    Value: !Ref InstanceProfile
+  UPFInstanceId:
+    Value: !Ref UPFInstance
+  UPFPrivateIp:
+    Value: !GetAtt UPFInstance.PrivateIp
